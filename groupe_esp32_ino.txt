@@ -1,0 +1,158 @@
+/*
+ * groupe_esp32.ino — Mesures d'un groupe électrogène -> MQTT
+ *
+ * Capteurs (à adapter à ton câblage) :
+ *   - PZEM-004T v3.0 (puissance)   : UART2  RX=GPIO16, TX=GPIO17
+ *   - DS18B20 étanche (température): GPIO4  (+ résistance 4,7 kΩ entre DATA et 3,3 V)
+ *   - MPU6050 (vibration)          : I2C    SDA=GPIO21, SCL=GPIO22, fixé sur le bloc moteur
+ *   - JSN-SR04T (niveau réservoir) : TRIG=GPIO26, ECHO=GPIO27 (ECHO : diviseur de tension 5 V -> 3,3 V !)
+ *
+ * Bibliothèques (Gestionnaire de bibliothèques Arduino) :
+ *   PubSubClient, OneWire, DallasTemperature, PZEM004Tv30
+ *
+ * Topic publié : groupes/<GROUPE_ID>/mesures  (lu par SourceCapteurs côté Python)
+ */
+
+#include <WiFi.h>
+#include <Wire.h>
+#include <PubSubClient.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <PZEM004Tv30.h>
+
+// ---------- À MODIFIER ----------
+const char* WIFI_SSID   = "MON_WIFI";
+const char* WIFI_PASS   = "MON_MOT_DE_PASSE";
+const char* MQTT_HOST   = "192.168.1.50";   // IP du PC/serveur qui fait tourner le broker (Mosquitto)
+const int   MQTT_PORT   = 1883;
+const char* GROUPE_ID   = "groupe1";        // un identifiant différent par groupe
+
+// Calibration du niveau : distances mesurées capteur -> surface du gasoil
+const float DIST_PLEIN_CM = 15.0;           // réservoir plein
+const float DIST_VIDE_CM  = 85.0;           // réservoir vide
+const float CAPACITE_L    = 200.0;
+// --------------------------------
+
+const int PIN_TRIG = 26, PIN_ECHO = 27, PIN_DS18B20 = 4;
+
+// Vibration : 256 échantillons à 500 Hz (0,5 s), 1 publication toutes les 2 s
+const int   N_ECH = 256;
+const int   FE_HZ = 500;
+const unsigned long PERIODE_PUB_MS = 2000;
+
+const uint8_t MPU_ADDR = 0x68;
+int16_t accel_mg[N_ECH];
+
+WiFiClient wifi;
+PubSubClient mqtt(wifi);
+OneWire oneWire(PIN_DS18B20);
+DallasTemperature ds18b20(&oneWire);
+PZEM004Tv30 pzem(Serial2, 16, 17);
+
+char topic[64];
+char payload[3500];
+
+// ---------- MPU6050 (lecture brute de l'axe Z, ±2 g) ----------
+void mpuInit() {
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x6B); Wire.write(0x00); Wire.endTransmission(); // réveil
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x1C); Wire.write(0x00); Wire.endTransmission(); // ±2 g
+}
+
+int16_t mpuLireZ_mg() {
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x3F); Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, (uint8_t)2);
+  int16_t brut = (Wire.read() << 8) | Wire.read();
+  return (int16_t)((int32_t)brut * 1000 / 16384);   // 16384 LSB/g en ±2 g -> milli-g
+}
+
+void echantillonnerVibration() {
+  const unsigned long pas_us = 1000000UL / FE_HZ;
+  unsigned long prochain = micros();
+  for (int i = 0; i < N_ECH; i++) {
+    while ((long)(micros() - prochain) < 0) { }
+    accel_mg[i] = mpuLireZ_mg();
+    prochain += pas_us;
+  }
+}
+
+// ---------- Niveau du réservoir (médiane de 5 mesures) ----------
+float lireDistanceCm() {
+  digitalWrite(PIN_TRIG, LOW);  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+  long us = pulseIn(PIN_ECHO, HIGH, 30000);
+  return us * 0.0343f / 2.0f;
+}
+
+float lireNiveauLitres() {
+  float d[5];
+  for (int i = 0; i < 5; i++) { d[i] = lireDistanceCm(); delay(60); }
+  for (int i = 0; i < 4; i++)
+    for (int j = 0; j < 4 - i; j++)
+      if (d[j] > d[j + 1]) { float t = d[j]; d[j] = d[j + 1]; d[j + 1] = t; }
+  float dist = d[2];
+  float frac = 1.0f - (dist - DIST_PLEIN_CM) / (DIST_VIDE_CM - DIST_PLEIN_CM);
+  return constrain(frac, 0.0f, 1.0f) * CAPACITE_L;
+}
+
+// ---------- Réseau ----------
+void connecterWifi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long debut = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - debut < 15000) delay(250);
+}
+
+void connecterMqtt() {
+  if (mqtt.connected() || WiFi.status() != WL_CONNECTED) return;
+  String id = String("esp32-") + GROUPE_ID;
+  mqtt.connect(id.c_str());   // ajoute utilisateur/mot de passe si ton broker en exige
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  ds18b20.begin();
+  mpuInit();
+  snprintf(topic, sizeof(topic), "groupes/%s/mesures", GROUPE_ID);
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setBufferSize(4096);           // le message fait ~2 Ko, défaut PubSubClient = 256 octets
+}
+
+unsigned long dernierePub = 0;
+
+void loop() {
+  connecterWifi();
+  connecterMqtt();
+  mqtt.loop();
+
+  if (millis() - dernierePub < PERIODE_PUB_MS) return;
+  dernierePub = millis();
+
+  ds18b20.requestTemperatures();
+  float temperature = ds18b20.getTempCByIndex(0);
+  float puissance   = pzem.power();
+  float niveau      = lireNiveauLitres();
+  echantillonnerVibration();
+
+  // Capteur débranché / erreur de lecture : on n'envoie pas de fausses valeurs
+  if (temperature == DEVICE_DISCONNECTED_C || isnan(puissance)) {
+    Serial.println("Lecture invalide (DS18B20 ou PZEM), mesure ignorée");
+    return;
+  }
+
+  int n = snprintf(payload, sizeof(payload),
+    "{\"temperature_c\":%.1f,\"puissance_w\":%.0f,\"niveau_l\":%.1f,\"fe_hz\":%d,\"accel_mg\":[",
+    temperature, puissance, niveau, FE_HZ);
+  for (int i = 0; i < N_ECH; i++)
+    n += snprintf(payload + n, sizeof(payload) - n, i ? ",%d" : "%d", accel_mg[i]);
+  snprintf(payload + n, sizeof(payload) - n, "]}");
+
+  if (mqtt.connected()) {
+    bool ok = mqtt.publish(topic, payload);
+    Serial.println(ok ? "Mesure publiée" : "Échec de publication");
+  }
+}
